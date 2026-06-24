@@ -19,6 +19,7 @@ webpush.setVapidDetails(
 
 // 订阅数据文件路径
 const SUBSCRIPTIONS_FILE = path.join(__dirname, 'subscriptions.json');
+const GROUPS_FILE = path.join(__dirname, 'groups.json');
 
 // 加载订阅数据
 function loadSubscriptions() {
@@ -44,6 +45,37 @@ function saveSubscriptions(subscriptions) {
     }
 }
 
+// 加载群聊数据
+function loadGroups() {
+    try {
+        if (fs.existsSync(GROUPS_FILE)) {
+            const data = fs.readFileSync(GROUPS_FILE, 'utf8');
+            const groupsArray = JSON.parse(data);
+            const groupsMap = new Map();
+            groupsArray.forEach(group => {
+                groupsMap.set(group.groupId, group);
+            });
+            console.log(`[群聊] 已加载 ${groupsMap.size} 个群聊数据`);
+            return groupsMap;
+        }
+    } catch (error) {
+        console.error('[错误] 加载群聊数据失败:', error);
+    }
+    return new Map();
+}
+
+// 保存群聊数据
+function saveGroups() {
+    try {
+        const groupsArray = Array.from(groups.values());
+        fs.writeFileSync(GROUPS_FILE, JSON.stringify(groupsArray, null, 2), 'utf8');
+        return true;
+    } catch (error) {
+        console.error('[错误] 保存群聊数据失败:', error);
+        return false;
+    }
+}
+
 // 全局订阅数据
 let subscriptions = loadSubscriptions();
 
@@ -51,7 +83,7 @@ let subscriptions = loadSubscriptions();
 const onlineUsers = new Map();
 
 // 群聊数据 Map: groupId -> { groupName, members, owner, history }
-const groups = new Map();
+const groups = loadGroups();
 
 // ==================== HTTP 服务器 ====================
 
@@ -169,6 +201,32 @@ const wss = new WebSocket.Server({ server });
 
 wss.on('connection', (ws) => {
     let currentUserId = null;
+    let heartbeatTimeout = null;
+    let pingInterval = null;
+
+    // 启动心跳检测：每30秒发送ping
+    const startHeartbeat = () => {
+        if (pingInterval) clearInterval(pingInterval);
+        pingInterval = setInterval(() => {
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'ping' }));
+                // 设置60秒超时，如果没收到pong就断开
+                if (heartbeatTimeout) clearTimeout(heartbeatTimeout);
+                heartbeatTimeout = setTimeout(() => {
+                    console.log(`[心跳超时] 用户 ${currentUserId} 60秒未响应，断开连接`);
+                    ws.terminate();
+                }, 60000);
+            }
+        }, 30000);
+    };
+
+    // 收到pong后清除超时
+    const resetHeartbeat = () => {
+        if (heartbeatTimeout) {
+            clearTimeout(heartbeatTimeout);
+            heartbeatTimeout = null;
+        }
+    };
 
     ws.on('message', (raw) => {
         try {
@@ -189,6 +247,12 @@ wss.on('connection', (ws) => {
                     onlineUsers.set(userId, { ws, nickname, avatar });
                     sendToClient(ws, { type: 'register_success' });
                     console.log(`[注册] ${nickname} (${userId}) 已上线，当前在线: ${onlineUsers.size}`);
+                    startHeartbeat();
+                    break;
+                }
+
+                case 'pong': {
+                    resetHeartbeat();
                     break;
                 }
 
@@ -274,6 +338,7 @@ wss.on('connection', (ws) => {
                         timestamp: Date.now(),
                         history: []
                     });
+                    saveGroups();
 
                     members.forEach(member => {
                         if (member.userId !== data.creatorId) {
@@ -302,26 +367,32 @@ wss.on('connection', (ws) => {
                     const groupData = groups.get(groupId);
                     const groupMembers = data.members || [];
 
-                    // 保存消息到群聊历史
+                    // 保存消息到群聊历史，带 created_at 字段
+                    const serverCreatedAt = Date.now(); // 服务器接收时间
                     if (groupData) {
                         if (!groupData.history) {
                             groupData.history = [];
                         }
-                        groupData.history.push({
+                        const messageRecord = {
                             fromUserId: data.fromUserId,
                             fromNickname: data.fromNickname,
                             fromAvatar: data.fromAvatar,
                             message: data.message,
                             timestamp: data.timestamp,
+                            created_at: serverCreatedAt,
                             messageId: data.messageId,
                             clientMessageId: data.clientMessageId,
                             isAiCharacter: data.isAiCharacter || false
-                        });
+                        };
+                        groupData.history.push(messageRecord);
 
                         // 限制历史记录数量，避免内存溢出
                         if (groupData.history.length > 1000) {
                             groupData.history = groupData.history.slice(-1000);
                         }
+
+                        // 持久化到文件
+                        saveGroups();
                     }
 
                     groupMembers.forEach(memberId => {
@@ -336,6 +407,7 @@ wss.on('connection', (ws) => {
                                     fromAvatar: data.fromAvatar,
                                     message: data.message,
                                     timestamp: data.timestamp,
+                                    created_at: serverCreatedAt, // 广播时带上 created_at
                                     messageId: data.messageId,
                                     clientMessageId: data.clientMessageId,
                                     isAiCharacter: data.isAiCharacter || false
@@ -408,7 +480,7 @@ wss.on('connection', (ws) => {
                 }
 
                 case 'get_group_history': {
-                    // 返回指定群聊的历史消息
+                    // 返回指定群聊的历史消息，按 created_at 升序排序
                     const groupId = data.groupId;
                     const groupData = groups.get(groupId);
                     if (!groupData) {
@@ -429,12 +501,24 @@ wss.on('connection', (ws) => {
                         });
                         break;
                     }
+
+                    // 确保所有消息都有 created_at 字段，没有的用 timestamp 补充
+                    const messages = (groupData.history || []).map(msg => {
+                        if (!msg.created_at) {
+                            msg.created_at = msg.timestamp || Date.now();
+                        }
+                        return msg;
+                    });
+
+                    // 按 created_at 升序排序
+                    messages.sort((a, b) => (a.created_at || 0) - (b.created_at || 0));
+
                     sendToClient(ws, {
                         type: 'group_history',
                         groupId: groupId,
-                        messages: groupData.history || []
+                        messages: messages
                     });
-                    console.log(`[群聊] 用户 ${currentUserId} 请求群 ${groupId} 历史，返回 ${(groupData.history || []).length} 条消息`);
+                    console.log(`[群聊] 用户 ${currentUserId} 请求群 ${groupId} 历史，返回 ${messages.length} 条消息`);
                     break;
                 }
 
@@ -461,7 +545,10 @@ wss.on('connection', (ws) => {
                         }
                     });
 
-                    // 通知所有群成员（包括新成员）
+                    // 持久化
+                    saveGroups();
+
+                    // 通知所有群成员（包括新成员）："你被加入/拉入了群 xxx"
                     groupData.members.forEach(member => {
                         const memberUser = onlineUsers.get(member.userId);
                         if (memberUser) {
@@ -499,24 +586,30 @@ wss.on('connection', (ws) => {
                     // 移除成员
                     groupData.members = groupData.members.filter(m => m.userId !== memberUserId);
 
-                    // 通知所有成员（包括被移除的）
+                    // 持久化
+                    saveGroups();
+
+                    // 通知被移除的用户："你被移出了群 xxx"
                     const removedUser = onlineUsers.get(memberUserId);
                     if (removedUser) {
                         sendToClient(removedUser.ws, {
                             type: 'member_removed',
                             groupId: groupId,
+                            groupName: groupData.groupName,
                             memberUserId: memberUserId,
                             members: groupData.members,
                             owner: groupData.owner
                         });
                     }
 
+                    // 通知剩余群成员
                     groupData.members.forEach(member => {
                         const memberUser = onlineUsers.get(member.userId);
                         if (memberUser) {
                             sendToClient(memberUser.ws, {
                                 type: 'member_removed',
                                 groupId: groupId,
+                                groupName: groupData.groupName,
                                 memberUserId: memberUserId,
                                 members: groupData.members,
                                 owner: groupData.owner
@@ -536,6 +629,11 @@ wss.on('connection', (ws) => {
     });
 
     ws.on('close', () => {
+        // 清理心跳定时器
+        if (pingInterval) clearInterval(pingInterval);
+        if (heartbeatTimeout) clearTimeout(heartbeatTimeout);
+
+        // 清理用户状态
         if (currentUserId) {
             const user = onlineUsers.get(currentUserId);
             if (user) {
