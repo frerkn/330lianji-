@@ -57,6 +57,10 @@ function loadGroups() {
             });
             console.log(`[群聊] 已加载 ${groupsMap.size} 个群聊数据`);
             return groupsMap;
+        } else {
+            // 文件不存在：主动创建一个空数组文件，避免下次写盘失败
+            console.log(`[群聊] ${GROUPS_FILE} 不存在，创建空文件...`);
+            fs.writeFileSync(GROUPS_FILE, '[]', 'utf8');
         }
     } catch (error) {
         console.error('[错误] 加载群聊数据失败:', error);
@@ -64,11 +68,18 @@ function loadGroups() {
     return new Map();
 }
 
-// 保存群聊数据
+// 保存群聊数据（强同步：写盘后立即 fsync，确保数据真的落到磁盘）
 function saveGroups() {
     try {
         const groupsArray = Array.from(groups.values());
-        fs.writeFileSync(GROUPS_FILE, JSON.stringify(groupsArray, null, 2), 'utf8');
+        const json = JSON.stringify(groupsArray, null, 2);
+        const fd = fs.openSync(GROUPS_FILE, 'w');
+        try {
+            fs.writeSync(fd, json, 0, 'utf8');
+            fs.fsyncSync(fd);  // 强制刷盘——防 PM2 SIGTERM 时数据丢失
+        } finally {
+            fs.closeSync(fd);
+        }
         return true;
     } catch (error) {
         console.error('[错误] 保存群聊数据失败:', error);
@@ -725,6 +736,11 @@ function shutdown() {
     console.log('\n');
     console.log('='.repeat(60));
     console.log('正在关闭服务器...');
+
+    // 【持久化】关闭前最后一次保存群聊数据
+    // 修 BUG：之前 shutdown() 不调 saveGroups()，PM2 重启时会丢最后一批群聊数据
+    const saved = saveGroups();
+    console.log(`[群聊] 关闭前保存群聊数据: ${saved ? '成功' : '失败'}`);
 
     // 通知所有客户端
     onlineUsers.forEach((user) => {
