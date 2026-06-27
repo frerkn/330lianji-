@@ -221,12 +221,14 @@ wss.on('connection', (ws) => {
         pingInterval = setInterval(() => {
             if (ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({ type: 'ping' }));
-                // 设置60秒超时，如果没收到pong就断开
+                // 【BUG 修复】60 秒 → 120 秒，对海外服务器 / 高延迟网络更宽容。
+                // 海外 RTT 可能 200-500ms，丢包率高时单次 ping/pong 可能要 1-2s，
+                // 加上连续几次重传，60 秒太严格。120 秒是合理上限。
                 if (heartbeatTimeout) clearTimeout(heartbeatTimeout);
                 heartbeatTimeout = setTimeout(() => {
-                    console.log(`[心跳超时] 用户 ${currentUserId} 60秒未响应，断开连接`);
+                    console.log(`[心跳超时] 用户 ${currentUserId} 120秒未响应，断开连接`);
                     ws.terminate();
-                }, 60000);
+                }, 120000);
             }
         }, 30000);
     };
